@@ -5,8 +5,8 @@ Replace those files with your own main.cpp and kernels.cl and just run the corre
 
 For CUDA you do not need any wrappers. Just upload your .cu file into the memory of colab, compile the file by doing: 
 
-'!nvcc -arch=sm_75 -o laplace_solver laplace_solver.cu'
+`!nvcc -arch=sm_75 -o laplace_solver laplace_solver.cu`
 
 then run it using:
 
-'!./laplace_solver'
+`!./laplace_solver`
