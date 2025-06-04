@@ -1,0 +1,246 @@
+#include <cuda_runtime.h>
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <fstream>
+#include <iomanip>
+#include <cmath>
+#include <algorithm>
+#include <string>
+
+// Laplace Solver Constants
+const float TOP_V = 5.0f;
+const float BOTTOM_V = -5.0f;
+const float SIDE_V = 0.0f;
+const float TOLERANCE = 1e-5f;
+const int MAX_ITERATIONS = 10000;
+
+// Timing structure
+struct myClock {
+    typedef std::chrono::high_resolution_clock clock;
+    std::chrono::time_point<clock> a1, a2;
+    void Start() { a1 = clock::now(); }
+    void Stop()  { a2 = clock::now(); }
+    double ElapsedTime() {
+        std::chrono::duration<double, std::milli> time_ms = a2 - a1;
+        return time_ms.count();
+    }
+};
+
+// Error checking macro for CUDA
+#define CUDA_CHECK(cmd) {                         \
+    cudaError_t error = cmd;                      \
+    if (error != cudaSuccess) {                   \
+        std::cerr << "CUDA error: " << cudaGetErrorString(error) \
+                  << " at " << __FILE__ << ":" << __LINE__ << "\n"; \
+        exit(EXIT_FAILURE);                       \
+    }                                             \
+}
+
+// Kernel for Laplace solver
+__global__ void laplace_kernel(float* next, const float* current, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    // Only update interior points (boundaries are fixed)
+    if (i > 0 && i < n-1 && j > 0 && j < n-1) {
+        int idx = i * n + j;
+        next[idx] = (current[(i-1)*n + j] + 
+                    current[(i+1)*n + j] +
+                    current[i*n + (j-1)] + 
+                    current[i*n + (j+1)]) * 0.25f;
+    }
+}
+
+void initializeGrid(float* grid, int n) {
+    // Initialize all points to 0
+    std::fill(grid, grid + n*n, 0.0f);
+
+    // Top boundary
+    for (int j = 0; j < n; ++j) grid[j] = TOP_V;
+    // Bottom boundary
+    for (int j = 0; j < n; ++j) grid[(n-1)*n + j] = BOTTOM_V;
+    // Left & right boundaries
+    for (int i = 0; i < n; ++i) {
+        grid[i*n] = SIDE_V;
+        grid[i*n + (n-1)] = SIDE_V;
+    }
+}
+
+// CSV Data Structure
+struct BenchmarkResult {
+    int grid_size;
+    int block_size;
+    double execution_time;
+    int iterations;
+    double final_delta;
+    bool converged;
+};
+
+void writeResultsToCSV(const std::vector<BenchmarkResult>& results, const std::string& filename) {
+    std::ofstream csvFile(filename);
+    
+    if (!csvFile.is_open()) {
+        std::cerr << "Error: Could not open file " << filename << " for writing." << std::endl;
+        return;
+    }
+    
+    // Write CSV header
+    csvFile << "Grid_Size,Block_Size,Execution_Time_ms,Iterations,Final_Delta,Converged\n";
+    
+    // Write data
+    for (const auto& result : results) {
+        csvFile << result.grid_size << ","
+                << result.block_size << ","
+                << std::fixed << std::setprecision(6) << result.execution_time << ","
+                << result.iterations << ","
+                << std::scientific << std::setprecision(6) << result.final_delta << ","
+                << (result.converged ? "true" : "false") << "\n";
+    }
+    
+    csvFile.close();
+    std::cout << "Results saved to " << filename << std::endl;
+}
+
+int main() {
+    std::vector<int> grid_sizes = {64, 128, 256, 512, 1024};
+    std::vector<int> block_sizes = {8, 16, 32};
+    myClock Clock;
+    std::vector<BenchmarkResult> all_results;
+
+    std::cout << "=== CUDA Laplace Equation Solver ===" << std::endl;
+    std::cout << "Boundary Conditions: Top=" << TOP_V << "V, Bottom=" << BOTTOM_V
+              << "V, Sides=" << SIDE_V << "V" << std::endl;
+    std::cout << "Tolerance: " << TOLERANCE << ", Max Iterations: " << MAX_ITERATIONS << std::endl << std::endl;
+
+    for (int size : grid_sizes) {
+        std::cout << "Grid size: " << size << "x" << size << std::endl;
+        std::cout << "--------------------------------------------" << std::endl;
+
+        int total_bytes = size * size * sizeof(float);
+        float *d_current, *d_next;
+        float *h_current = new float[size*size];
+        float *h_next = new float[size*size];
+
+        // Initialize grid
+        initializeGrid(h_current, size);
+        initializeGrid(h_next, size);
+
+        // Allocate device memory
+        CUDA_CHECK(cudaMalloc(&d_current, total_bytes));
+        CUDA_CHECK(cudaMalloc(&d_next, total_bytes));
+
+        // Copy initial data to device
+        CUDA_CHECK(cudaMemcpy(d_current, h_current, total_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_next, h_next, total_bytes, cudaMemcpyHostToDevice));
+
+        double best_time = std::numeric_limits<double>::max();
+        int best_bs = 0;
+
+        for (int bs : block_sizes) {
+            if (size % bs != 0) continue;
+
+            dim3 threadsPerBlock(bs, bs);
+            dim3 blocksPerGrid(size / bs, size / bs);
+
+            std::vector<double> times;
+            int iterations = 0;
+            double max_delta = 0.0;
+            bool converged = false;
+
+            for (int run = 0; run < 3; ++run) {
+                // Reset to initial state
+                initializeGrid(h_current, size);
+                initializeGrid(h_next, size);
+                CUDA_CHECK(cudaMemcpy(d_current, h_current, total_bytes, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(d_next, h_next, total_bytes, cudaMemcpyHostToDevice));
+
+                Clock.Start();
+                converged = false;
+                for (iterations = 0; iterations < MAX_ITERATIONS; ++iterations) {
+                    // Launch kernel
+                    laplace_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_next, d_current, size);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+
+                    // Swap pointers
+                    std::swap(d_current, d_next);
+
+                    // Check convergence periodically
+                    if (iterations % 100 == 0) {
+                        // Copy both buffers to host
+                        CUDA_CHECK(cudaMemcpy(h_current, d_current, total_bytes, cudaMemcpyDeviceToHost));
+                        CUDA_CHECK(cudaMemcpy(h_next, d_next, total_bytes, cudaMemcpyDeviceToHost));
+                        
+                        // Calculate maximum delta
+                        max_delta = 0.0;
+                        for (int i = 0; i < size; ++i) {
+                            for (int j = 0; j < size; ++j) {
+                                int idx = i*size + j;
+                                double diff = std::abs(h_current[idx] - h_next[idx]);
+                                if (diff > max_delta) max_delta = diff;
+                            }
+                        }
+                        
+                        if (max_delta < TOLERANCE) {
+                            converged = true;
+                            break;
+                        }
+                    }
+                }
+                
+                // Final convergence check if not already converged
+                if (!converged) {
+                    CUDA_CHECK(cudaMemcpy(h_current, d_current, total_bytes, cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(h_next, d_next, total_bytes, cudaMemcpyDeviceToHost));
+                    max_delta = 0.0;
+                    for (int i = 0; i < size; ++i) {
+                        for (int j = 0; j < size; ++j) {
+                            int idx = i*size + j;
+                            double diff = std::abs(h_current[idx] - h_next[idx]);
+                            if (diff > max_delta) max_delta = diff;
+                        }
+                    }
+                }
+                Clock.Stop();
+                times.push_back(Clock.ElapsedTime());
+            }
+
+            double avg_time = (times[1] + times[2]) / 2.0;
+            std::cout << "CUDA (" << bs << "x" << bs << "): "
+                      << std::fixed << std::setprecision(3) << avg_time
+                      << " ms, " << iterations << " iterations, Final Δ=" 
+                      << std::scientific << std::setprecision(6) << max_delta;
+            if (converged) std::cout << " (CONVERGED)";
+            std::cout << std::endl;
+
+            // Save results for this configuration
+            BenchmarkResult result;
+            result.grid_size = size;
+            result.block_size = bs;
+            result.execution_time = avg_time;
+            result.iterations = iterations;
+            result.final_delta = max_delta;
+            result.converged = converged;
+            all_results.push_back(result);
+
+            if (avg_time < best_time) {
+                best_time = avg_time;
+                best_bs = bs;
+            }
+        }
+
+        std::cout << "\nBest CUDA (" << best_bs << "x" << best_bs << "): " 
+                  << best_time << " ms\n" << std::endl;
+
+        // Cleanup
+        CUDA_CHECK(cudaFree(d_current));
+        CUDA_CHECK(cudaFree(d_next));
+        delete[] h_current;
+        delete[] h_next;
+    }
+
+    // Write all results to CSV
+    writeResultsToCSV(all_results, "cuda_laplace_benchmarks.csv");
+
+    return 0;
+}
